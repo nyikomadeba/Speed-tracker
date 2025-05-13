@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Speed Tracker for Students</title>
+  <style>
+    canvas { border: 2px solid #555; cursor: crosshair; }
+    #output, #status { margin-top: 15px; font-size: 18px; white-space: pre-line; }
+    body { font-family: sans-serif; max-width: 680px; margin: auto; padding: 20px; }
+    input, button { margin-bottom: 10px; padding: 6px; font-size: 16px; }
+  </style>
+</head>
+<body>
+<h2>Speed Tracker (Golf Ball & Marker)</h2>
+
+<label>Select a video file:</label><br>
+<input type="file" id="videoInput" accept="video/*"><br><br>
+
+<label>Marker width (cm):</label><br>
+<input type="number" id="markerWidth" value="2"><br>
+
+<label>Golf ball diameter (cm):</label><br>
+<input type="number" id="ballDiameter" value="4.3"><br>
+
+<label>Color tolerance:</label><br>
+<input type="number" id="colorTolerance" value="50" min="0" max="441"><br><br>
+
+<video id="video" width="320" controls></video><br>
+<p><strong>Instructions:</strong><br>
+1. The video pauses automatically.<br>
+2. Click the marker color (1st click), then the ball (2nd click).<br></p>
+
+<canvas id="canvas" width="320" height="240"></canvas><br>
+
+<button onclick="analyze()">Analyze Speed</button>
+<button onclick="resetSelections()">Reset Selections</button>
+<button onclick="restart()">Restart</button>
+
+<div style="margin-top: 15px;">
+  <strong>Selected Colors:</strong><br>
+  Marker: <span id="markerSwatch" style="display:inline-block;width:30px;height:20px;border:1px solid #000;"></span>
+  &nbsp;&nbsp;
+  Ball: <span id="ballSwatch" style="display:inline-block;width:30px;height:20px;border:1px solid #000;"></span>
+</div>
+
+<div style="margin-top: 15px;">
+  <strong>Frame Snapshot:</strong><br>
+  <canvas id="snapshot" width="160" height="120" style="border:1px solid #ccc;"></canvas>
+</div>
+
+<div id="status"></div>
+<div id="output"></div>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const markerSwatch = document.getElementById('markerSwatch');
+const ballSwatch = document.getElementById('ballSwatch');
+const snapshot = document.getElementById('snapshot');
+const snapCtx = snapshot.getContext('2d');
+
+let markerColor = null;
+let ballColor = null;
+let clickCount = 0;
+let lastSeenFrame = null;
+let firstSeenAfterMissing = null;
+let wasVisible = false;
+let frameIndex = 0;
+const FPS = 30;
+let ballPath = [];
+let ballBoundingBoxWidth = null;
+let totalFrames = 0;
+let startTime = 0;
+
+document.getElementById('videoInput').addEventListener('change', e => {
+  const file = e.target.files[0];
+  const url = URL.createObjectURL(file);
+  video.src = url;
+  resetSelections();
+  video.addEventListener('loadeddata', () => {
+    video.pause();
+    setTimeout(() => {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    }, 100);
+  }, { once: true });
+});
+
+canvas.addEventListener('click', e => {
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const pixel = ctx.getImageData(x, y, 1, 1).data;
+  const color = { r: pixel[0], g: pixel[1], b: pixel[2] };
+  snapCtx.drawImage(video, 0, 0, snapshot.width, snapshot.height);
+  if (clickCount === 0) {
+    markerColor = color;
+    markerSwatch.style.backgroundColor = `rgb(${color.r},${color.g},${color.b})`;
+    alert("Marker color selected!");
+  } else if (clickCount === 1) {
+    ballColor = color;
+    ballSwatch.style.backgroundColor = `rgb(${color.r},${color.g},${color.b})`;
+    alert("Golf ball color selected!");
+  }
+  clickCount++;
+});
+
+function resetSelections() {
+  markerColor = null;
+  ballColor = null;
+  clickCount = 0;
+  markerSwatch.style.backgroundColor = "";
+  ballSwatch.style.backgroundColor = "";
+  document.getElementById('output').innerText = "";
+  document.getElementById('status').innerText = "";
+}
+
+function restart() {
+  resetSelections();
+  video.currentTime = 0;
+  frameIndex = 0;
+  video.play();
+}
+
+function colorDistance(r1, g1, b1, r2, g2, b2) {
+  return Math.sqrt((r1 - r2)**2 + (g1 - g2)**2 + (b1 - b2)**2);
+}
+
+function analyze() {
+  if (!markerColor || !ballColor) {
+    alert("Please select marker and golf ball colors by clicking the canvas.");
+    return;
+  }
+  video.currentTime = 0;
+  frameIndex = 0;
+  wasVisible = false;
+  lastSeenFrame = null;
+  firstSeenAfterMissing = null;
+  ballPath = [];
+  ballBoundingBoxWidth = 0;
+  totalFrames = Math.floor(video.duration * FPS);
+  startTime = performance.now();
+  video.pause();
+  processNextFrame();
+}
+
+function processNextFrame() {
+  const elapsedTime = (performance.now() - startTime) / 1000;
+  const estimatedTotal = (elapsedTime / frameIndex) * totalFrames || 0;
+  const estimatedLeft = estimatedTotal - elapsedTime;
+  document.getElementById('status').innerText = 
+    `Analyzing frame ${frameIndex + 1} of ${totalFrames}
+` +
+    `Elapsed: ${elapsedTime.toFixed(1)}s | Remaining: ${estimatedLeft.toFixed(1)}s`;
+  if (video.currentTime >= video.duration) {
+    document.getElementById('status').innerText = "Processing complete!";
+    calculateBothSpeeds();
+    return;
+  }
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  const tolerance = parseInt(document.getElementById('colorTolerance').value);
+  let foundMarker = false;
+  let ballPixels = [];
+  for (let i = 0; i < imageData.length; i += 4) {
+    const r = imageData[i], g = imageData[i + 1], b = imageData[i + 2];
+    const x = ((i / 4) % canvas.width);
+    const y = Math.floor((i / 4) / canvas.width);
+    if (colorDistance(r, g, b, markerColor.r, markerColor.g, markerColor.b) <= tolerance) {
+      foundMarker = true;
+    }
+    if (colorDistance(r, g, b, ballColor.r, ballColor.g, ballColor.b) <= tolerance) {
+      ballPixels.push({ x, y });
+    }
+  }
+  if (foundMarker) {
+    if (!wasVisible && lastSeenFrame !== null) {
+      firstSeenAfterMissing = frameIndex;
+    }
+    lastSeenFrame = frameIndex;
+    wasVisible = true;
+  } else if (wasVisible) {
+    wasVisible = false;
+  }
+  if (ballPixels.length > 0) {
+    let xSum = 0, ySum = 0;
+    let xMin = Infinity, xMax = -Infinity;
+    for (let p of ballPixels) {
+      xSum += p.x;
+      ySum += p.y;
+      if (p.x < xMin) xMin = p.x;
+      if (p.x > xMax) xMax = p.x;
+    }
+    const centerX = xSum / ballPixels.length;
+    const centerY = ySum / ballPixels.length;
+    ballPath.push({ x: centerX, y: centerY });
+    const width = xMax - xMin;
+    if (width > ballBoundingBoxWidth) {
+      ballBoundingBoxWidth = width;
+    }
+  }
+  frameIndex++;
+  video.currentTime += 1 / FPS;
+  setTimeout(processNextFrame, 15);
+}
+
+function calculateBothSpeeds() {
+  const markerWidth = parseFloat(document.getElementById('markerWidth').value);
+  const ballDiameter = parseFloat(document.getElementById('ballDiameter').value);
+  const deltaFrames = firstSeenAfterMissing - lastSeenFrame;
+  const deltaT = deltaFrames / FPS;
+  const speed1 = (markerWidth / 100) / deltaT;
+  let totalPixels = 0;
+  for (let i = 1; i < ballPath.length; i++) {
+    const dx = ballPath[i].x - ballPath[i - 1].x;
+    const dy = ballPath[i].y - ballPath[i - 1].y;
+    totalPixels += Math.sqrt(dx * dx + dy * dy);
+  }
+  const pixelToCM = ballDiameter / (ballBoundingBoxWidth || 10);
+  const distanceCM = totalPixels * pixelToCM;
+  const totalTime = ballPath.length / FPS;
+  const speed2 = (distanceCM / 100) / totalTime;
+  const finalSpeed = (speed1 + speed2) / 2;
+  document.getElementById('output').innerText =
+    `Method 1 (marker disappear/reappear): ${speed1.toFixed(2)} m/s
+` +
+    `Method 2 (golf ball tracking): ${speed2.toFixed(2)} m/s
+
+` +
+    `Final estimated speed: ${finalSpeed.toFixed(2)} m/s`;
+}
+</script>
+</body>
+</html>
